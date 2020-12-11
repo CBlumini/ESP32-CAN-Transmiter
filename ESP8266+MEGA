@@ -1,0 +1,340 @@
+/*
+    This Arduino sketch sends NBP formatted packages from an Arudino 2560 Mega
+    to an ESP8266 wi-fi board where it is broadcast out in UDP.
+
+    This code is provided as an example that simply sends random numbers, the
+    broadcast frequency, and a package count to the NBP receiver. For simplicity,
+    connections to sensors is not coded in this sketch.
+    In a real scenario one or more sensors would be connected to the Arduino
+    and their values sent in the same manner as the random numbers shown here.
+
+    The red and green LED lights are used to indicate status.
+    After a reboot both the red and green lights come on and stay on while the
+    setup() method is running.
+
+    When an AT error is detected during a broadcast attempt the red LED lights up
+    and stays lit until the next successful package broadcast or until it starts
+    waiting for a connection.
+
+    While waiting for a connection the red LED will slowly glow brighter and reset to
+    off over and over.
+
+    When a connection is established and packages are being sent successfully the green
+    LED will flash every number of packages sent based on the blinkFrequency variable.
+*/
+
+// Define Metadata.
+const String DEVICE_NAME = "My NBP Device";
+
+// Define behaviors.
+const bool DEBUG = true; // Sends debugging info back to the Serial device.
+const bool ECHO_PACKAGE = false; // Sends the raw NBP packages back to the Serial device. Only works if DEBUG also true.
+const bool KEEPALIVE_OFF = true; // Only supported in TrackAddict v4.6.4 and higher.
+
+// Define LED Pins used to indicate status.
+const byte RED = 12;
+const byte GREEN = LED_BUILTIN;
+
+// Number of package cycles to blink green status light
+const byte blinkFrequency = 25;
+
+// Keep track of when to send the UpdateAll NBP.
+const unsigned long updateAllFrequency = 4999;
+unsigned long lastUpdateAllMillis = 0;
+unsigned long now = millis();
+unsigned long lastNow = 0;
+
+// Keep track of AT communication errors.
+int consecutiveErrorCount = 0;
+int consecutiveErrorCountLimit = 25;
+unsigned long loopCount = 0;
+
+void setup() {
+  // Setup and turn on the LED lights.
+  pinMode(RED, OUTPUT);
+  pinMode(GREEN, OUTPUT);
+  analogWrite(RED, 100);
+  analogWrite(GREEN, 100);
+
+  // Setup the random number generator.
+  randomSeed(analogRead(1));
+
+  // Setup local serial connection.
+  if (DEBUG) {
+    Serial.begin(9600);
+  }
+
+  // Setup serial connection with ESP8266.
+  Serial1.begin(115200);
+
+  // Setup the AT server on the ESP8266.
+  sendDataUntil("AT+RST\r\n", 1250, "ready"); // reset the server
+  sendDataUntil("AT+CIPMUX=1\r\n", 1250, "OK"); // set multi mode
+  sendDataUntil("AT+CIPSERVER=1,80\r\n", 1250, "OK"); // setup server
+
+  if (DEBUG) {
+    Serial.println("ESP8266 AT Commands Configured");
+  }
+
+  // Turn off the LED lights.
+  digitalWrite(RED, LOW);
+  digitalWrite(GREEN, LOW);
+
+  waitForConnection();
+}
+
+void waitForConnection()
+{
+  if (DEBUG) {
+    Serial.println("Waiting for connection...");
+  }
+
+  String response = "";
+  bool keepTrying = true;
+  bool foundConnect = false;
+  bool foundIpd = false;
+  byte ledBrightness = 0;
+
+  while (keepTrying) {
+    while (keepTrying && Serial1.available()) {
+      char c = Serial1.read();
+      response += c;
+      foundConnect = response.endsWith(",CONNECT");
+      foundIpd = response.endsWith("+IPD");
+      keepTrying = !foundConnect && !foundIpd;
+    }
+
+    // Slowly increase brightness of the red led.
+    analogWrite(RED, ledBrightness / 4);
+    ledBrightness += 8;
+    delay(50);
+  }
+
+  if (DEBUG) {
+    Serial.println("Connection Established!");
+  }
+
+  if (KEEPALIVE_OFF) { // Only supported in TrackAddict v4.6.4 and higher.
+    sendNbpPackage("@NAME:" + DEVICE_NAME + "\n@KEEPALIVE:OFF\n");
+  }
+
+  analogWrite(RED, LOW);
+}
+
+// Keep track of the number of broadcasts made each second.
+byte FrequencyIndex = 0;
+float FrequencySum = 0;
+const int FrequencyWindowSize = 50;
+float Frequencies[FrequencyWindowSize];
+float CurrentAverageFrequency = 0.0;
+
+// Calling this method updates when a packet is set and the frequency is calculated.
+void broadcastFrequencyPing() {
+  float currentFrequency = 1000.0 / (now - lastNow); // Calculate the current value.
+  FrequencySum -= Frequencies[FrequencyIndex]; // Remove oldest from sum.
+  Frequencies[FrequencyIndex] = currentFrequency; // Add newest reading to the window.
+  FrequencySum += currentFrequency; // Add newest frequency to sum.
+  FrequencyIndex = (FrequencyIndex + 1) % FrequencyWindowSize; // Increment index, wrap to 0.
+  CurrentAverageFrequency = FrequencySum / FrequencyWindowSize; // Calculate the average.
+  lastNow = now;
+}
+
+// This method returns the current average frequency as calculated by broadcastFrequencyPing().
+float getBroadcastFrequency() {
+  return CurrentAverageFrequency;
+}
+
+// Over and over...
+void loop() {
+  now = millis();
+  loopCount++;
+
+  broadcastFrequencyPing();
+
+  // If we have too many errors assume there is no connection.
+  if (consecutiveErrorCount >= consecutiveErrorCountLimit) {
+    if (DEBUG) {
+      Serial.println("Consecutive Error Count Limit Exceeded");
+    }
+    waitForConnection();
+  }
+
+  // Turn on the green LED if the blink frequency matches.
+  if (loopCount % blinkFrequency == 0) {
+    analogWrite(GREEN, 30);
+  }
+
+  // Send the UpdateAll package on the specified frequency.
+  if ((now - lastUpdateAllMillis) >= updateAllFrequency) {
+    sendNbpPackage(GetUpdateNbpPackage(true));
+    lastUpdateAllMillis += updateAllFrequency;
+  }
+  // Send the Update package on all other loops.
+  else {
+    sendNbpPackage(GetUpdateNbpPackage(false));
+  }
+
+  // Turn off any LEDs at the end of the loop.
+  if (loopCount % blinkFrequency == 0) {
+    digitalWrite(RED, LOW);
+    digitalWrite(GREEN, LOW);
+  }
+}
+
+// Convenience method for buidling a NBP content line with a float value.
+String buildNbpContentLine(String channel, String unit, float value, int precision) {
+  return "\"" + channel + "\",\"" + unit + "\":" + String(value, precision) + "\n";
+}
+
+// Convenience method for buidling a NBP content line with an integer value.
+String buildNbpContentLine(String channel, String unit, int value) {
+  return "\"" + channel + "\",\"" + unit + "\":" + String(value) + "\n";
+}
+
+// Setup global variables to keep track of value changes.
+float lastBroadcastFrequency;
+float lastRandomFloat;
+int lastRandomInt;
+
+// This method builds a full NBP package. If updateAll is true then the NBP UPDATEALL package
+// is used and the metadata name line is included.
+String GetUpdateNbpPackage(bool updateAll) {
+  float currentBroadcastFrequency = getBroadcastFrequency();
+  float currentRandomFloat = random(1, 1000) / 10.0;
+  int currentRandomInt = random(1, 100);
+
+  // Start to build the package based on the updateAll boolean.
+  String toReturn = "*NBP1,UPDATE" + String(updateAll ? "ALL" : "") + "," + String(now / 1000.0, 3) + "\n";
+
+  // Include the broadcast frequency only if the value has changed or this is an update all request.
+  if (updateAll || lastBroadcastFrequency != currentBroadcastFrequency) {
+    lastBroadcastFrequency = currentBroadcastFrequency;
+    toReturn += buildNbpContentLine("NBP Freq.", "Hz", currentBroadcastFrequency, 1);
+  }
+
+  // Include the random float only if the value has changed or this is an update all request.
+  if (updateAll || lastRandomFloat != currentRandomFloat) {
+    lastRandomFloat != currentRandomFloat;
+    toReturn += buildNbpContentLine("Random Float", "Num", currentRandomFloat, 1);
+  }
+
+  // Include the random integer only if the value has changed or this is an update all request.
+  if (updateAll || lastRandomInt != currentRandomInt) {
+    lastRandomInt != currentRandomInt;
+    toReturn += buildNbpContentLine("Random Int", "Num", currentRandomInt);
+  }
+
+  // Always include the pacakge count, it is always different.
+  toReturn += buildNbpContentLine("Pkg. Count", "Num", loopCount);
+
+  // End the pacakge.
+  toReturn += "#\n";
+
+  if (updateAll) {
+    toReturn += "@NAME:" + DEVICE_NAME + "\n";
+  }
+
+  if (ECHO_PACKAGE && DEBUG) {
+    Serial.println();
+    Serial.println(toReturn);
+    Serial.println();
+  }
+
+  return toReturn;
+}
+
+// Send the nbpPackage wrapped in an AT Send command.
+void sendNbpPackage(String nbpPackage) {
+  byte atTimeout = 200;
+  String atCipSendCommand = "AT+CIPSEND=0," + String(nbpPackage.length()) + "\r\n";
+
+  Serial1.print(atCipSendCommand); // send the command to the esp8266
+
+  String response = "";
+  unsigned long time = millis();
+  bool keepTrying = true;
+  bool foundExpected = false;
+  bool foundError = false;
+
+  while (keepTrying && (time + atTimeout) > millis()) {
+    while (keepTrying && Serial1.available()) {
+      char c = Serial1.read();
+      response += c;
+      foundExpected = response.endsWith(">");
+      foundError = response.endsWith("ERROR");
+      keepTrying = !foundExpected && !foundError;
+    }
+  }
+
+  if (foundError) {
+    digitalWrite(RED, HIGH);
+    consecutiveErrorCount++;
+
+    if (DEBUG) {
+      Serial.println("\nError: (#" + String(consecutiveErrorCount) + ")");
+      Serial.println(response);
+      Serial.println();
+    }
+
+  } else if (foundExpected) {
+    Serial1.print(nbpPackage);
+
+    consecutiveErrorCount = 0;
+
+    response = "";
+    time = millis();
+    keepTrying = true;
+    foundExpected = false;
+    foundError = false;
+
+    while (keepTrying && (time + atTimeout) > millis()) {
+      while (keepTrying && Serial1.available()) {
+        char c = Serial1.read();
+        response += c;
+        foundExpected = response.endsWith("SEND OK");
+        foundError = response.endsWith("ERROR");
+        keepTrying = !foundExpected && !foundError;
+      }
+    }
+
+    if (foundError) {
+      digitalWrite(RED, HIGH);
+
+      if (DEBUG) {
+        Serial.println("\nError:");
+        Serial.println(response);
+        Serial.println();
+      }
+    }
+  }
+}
+
+// This method is used to send the setup commands to the ESP8266.
+void sendDataUntil(String command, const int timeout, String expected) {
+  Serial1.print(command); // Send the command to the ESP8266.
+
+  String response = "";
+  unsigned long time = millis();
+  bool keepTrying = true;
+  bool foundExpected = false;
+  bool foundError = false;
+
+  while (keepTrying && (time + timeout) > millis()) {
+    while (keepTrying && Serial1.available()) {
+      char c = Serial1.read();
+      response += c;
+      foundExpected = response.endsWith(expected);
+      foundError = response.endsWith("ERROR");
+      keepTrying = !foundExpected && !foundError;
+    }
+  }
+
+  if (foundError) {
+    if (DEBUG) {
+      Serial.println("\nError:");
+      Serial.println(response);
+      Serial.println();
+    }
+    analogWrite(RED, 200);
+  }
+}
